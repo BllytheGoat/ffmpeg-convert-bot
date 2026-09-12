@@ -1,0 +1,18 @@
+{
+  "name": "ffmpeg-convert-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram bot that converts image/video files to 5 chosen formats via FFmpeg, with optional lossless compression, hosted on Vercel",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "ffmpeg-static": "^5.2.0",
+    "axios": "^1.7.0"
+  },
+  "devDependencies": {}
+}

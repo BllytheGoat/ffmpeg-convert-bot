@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/vercel/vercel/master/vercel.json",
+  "version": 2,
+  "functions": {
+    "index.js": {
+      "maxDuration": 300
+    }
+  }
+}
