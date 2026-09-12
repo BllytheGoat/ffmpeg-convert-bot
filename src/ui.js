@@ -14,9 +14,14 @@
 //     (the formats are a set, not a sequence).
 //   * The 5 format buttons stay bare (the format name IS the label) but the
 //     row is chunked 3-per-line so it's scannable on a phone.
+//   * A format must be picked before the flow can move on: the "Continue"
+//     button stays visible but the bot refuses to start until one is chosen,
+//     and tells the user plainly to pick one.
+//   * Conversion shows a live progress bar + a soft time estimate, not an
+//     instant jump. Results only appear once every format has finished.
 //   * Errors give direction, not mood.
-//   * An action keeps the same name end-to-end: the button says "Start" and
-//     the result says "Converted".
+//   * An action keeps the same name end-to-end: the button says "Continue"
+//     and the result says "Converted".
 
 const FORMAT_CHOICES = {
   image: ['PNG', 'JPEG', 'WEBP', 'GIF', 'AVIF'],
@@ -58,33 +63,62 @@ function idCard(name, spec) {
 
 // ---- messages -------------------------------------------------------------
 
-// Intake: ID card leads, one quiet instruction.
+// Intake: ID card leads, explicit instruction that a pick is required.
 function intake(name, spec) {
-  return `${idCard(name, spec)}\n\nTap a format to add it to the conversion.`;
+  return `${idCard(name, spec)}\n\nPick one or more formats below. You can't continue until you pick at least one.`;
 }
 
 // Picking state: ID card persists, picks shown as a set.
 function picked(name, spec, picks) {
   const list = picks.length ? picks.join(' · ') : 'nothing yet';
-  return `${idCard(name, spec)}\n\n*Picked:* ${list}`;
+  const hint = picks.length
+    ? `Tap Continue when ready.`
+    : `Pick a format first — you can't continue without one.`;
+  return `${idCard(name, spec)}\n\n*Picked:* ${list}\n\n${hint}`;
 }
 
-// Compress toggle — plain, names the tradeoff in the user's terms.
-function compressNote(on) {
-  return on
-    ? 'Compress: on. Smaller files, little quality loss.'
-    : 'Compress: off. Full quality, larger files.';
+// Shown when the user taps Continue without picking anything.
+function needsFormatPick() {
+  return 'Pick a format first. Tap one of the options above, then Continue.';
 }
 
-// In progress.
-function converting(name, spec, picks, compress) {
+// A soft total-time estimate in seconds. Rough, deliberately imprecise —
+// video encodes run ~real-time on serverless, images are near-instant.
+function estimateSeconds(fileBytes, nFormats, kind) {
+  const mb = (fileBytes || 0) / 1048576;
+  const per = kind === 'image'
+    ? Math.min(12, 3 + mb * 0.5)   // images: a few seconds, grows mildly with size
+    : Math.min(90, 8 + mb * 0.9);  // video: near real-time, grows with size
+  return Math.max(10, Math.round(per * nFormats));
+}
+
+// A 16-cell text progress bar. `done`/`total` drive how many are filled.
+function progress_bar(done, total) {
+  const cells = 16;
+  const fill = total ? Math.round((done / total) * cells) : 0;
+  return '█'.repeat(Math.max(0, Math.min(cells, fill))) + '░'.repeat(cells - Math.max(0, Math.min(cells, fill)));
+}
+
+// Live progress message. `done`/`total` are finished/total formats;
+// `elapsedSec` and `estSec` are real wall-clock and the soft estimate.
+function convertingProgress(name, spec, picks, compress, done, total, elapsedSec, estSec) {
   const what = picks.join(', ');
-  return `${idCard(name, spec)}\n\nConverting to ${what}… ` +
-    `${compress ? 'Compressing. ' : ''}This can take a minute for longer clips.`;
+  const mm = String(Math.floor(elapsedSec / 60));
+  const ss = String(elapsedSec % 60).padStart(2, '0');
+  const left = Math.max(0, estSec - elapsedSec);
+  const leftStr = left <= 0 ? 'finishing up' : `≈ ${Math.ceil(left / 60)} min left`;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  return [
+    idCard(name, spec),
+    '',
+    `Converting to ${what}… ${compress ? 'Compressing. ' : ''}`,
+    '',
+    `\`${progress_bar(done, total)}\` ${done}/${total} done · ${pct}% · ${mm}:${ss} elapsed · ${leftStr}`,
+  ].join('\n');
 }
 
-// Results: active word matches the button ("Converted").
-function results(name, items, errors) {
+// The results message only appears after every format has finished (or failed).
+function results(name, items, errors, elapsedSec) {
   let out = `Converted ${esc(name)}:\n`;
   for (const r of items) {
     const size = r.size ? sizeLabel(r.size) : '';
@@ -94,7 +128,8 @@ function results(name, items, errors) {
     out += `\n\nDidn't convert:\n`;
     for (const e of errors) out += `*${e.fmt}* — ${esc(e.message)}\n`;
   }
-  out += `\n\nThese files expire in 3 days.`;
+  const mm = Math.floor(elapsedSec / 60), ss = elapsedSec % 60;
+  out += `\n\nDone in ${mm}:${String(ss).padStart(2, '0')}. These files expire in 3 days.`;
   return out;
 }
 
@@ -117,8 +152,9 @@ function cancelled() {
 
 // ---- keyboard -------------------------------------------------------------
 
-// One row of up to 3 format buttons, then Start (when ≥1 picked), then the
-// control row (compress toggle + cancel).
+// One row of up to 3 format buttons, then the "Continue" button (always
+// visible — it just won't start until a format is picked), then the control
+// row (compress toggle + cancel).
 function keyboard(kind, session) {
   const formats = FORMAT_CHOICES[kind] || FORMAT_CHOICES.video;
   const picked = new Set(session.pendingFormats);
@@ -131,7 +167,7 @@ function keyboard(kind, session) {
       })),
     );
   }
-  if (picked.size >= 1) rows.push([{ text: 'Start', callback_data: 'go' }]);
+  rows.push([{ text: 'Continue', callback_data: 'go' }]);
   rows.push([
     {
       text: session.compress ? 'Compress: on' : 'Compress: off',
@@ -150,8 +186,10 @@ module.exports = {
   sizeLabel,
   intake,
   picked,
-  compressNote,
-  converting,
+  needsFormatPick,
+  estimateSeconds,
+  progress_bar,
+  convertingProgress,
   results,
   tooBig,
   downloadFailed,

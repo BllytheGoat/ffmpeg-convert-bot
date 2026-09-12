@@ -228,8 +228,7 @@ async function handleCallback(cq) {
     await tg('editMessageText', {
       chat_id: chatId,
       message_id: cq.message.message_id,
-      text: ui.picked(session.name, session.spec, session.pendingFormats) +
-        `\n\n${ui.compressNote(session.compress)}`,
+      text: ui.picked(session.name, session.spec, session.pendingFormats),
       parse_mode: 'Markdown',
       reply_markup: ui.keyboard(session.kind, session),
     });
@@ -253,9 +252,12 @@ async function handleCallback(cq) {
 
   if (data === 'go') {
     if (session.pendingFormats.length === 0) {
+      // The user pressed Continue without picking anything. Don't advance —
+      // send a fresh nudge (a separate message, since the old one's keyboard
+      // is already there) and keep the session alive.
       await tg('sendMessage', {
         chat_id: chatId,
-        text: ui.noFormat(),
+        text: ui.needsFormatPick(),
       });
       return;
     }
@@ -269,15 +271,39 @@ async function handleCallback(cq) {
 // ---------------------------------------------------------------------------
 async function startConversion(chatId, session) {
   const { source, pendingFormats, compress, name, spec } = session;
+  const total = pendingFormats.length;
+  const fileBytes = fs.existsSync(source) ? fs.statSync(source).size : 0;
+  const estSec = ui.estimateSeconds(fileBytes, total, session.kind);
+  const t0 = Date.now();
+
+  // 1. Open the progress message at 0/total.
   const statusMsg = await tg('sendMessage', {
     chat_id: chatId,
-    text: ui.converting(name, spec, pendingFormats, compress),
+    text: ui.convertingProgress(name, spec, pendingFormats, compress, 0, total, 0, estSec),
     parse_mode: 'Markdown',
   });
 
+  // 2. Live ticker: refresh the bar every 2s with real elapsed time, so the
+  //    user watches it fill instead of getting an instant jump.
+  const timer = setInterval(async () => {
+    try {
+      const elapsed = Math.floor((Date.now() - t0) / 1000);
+      await tg('editMessageText', {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        text: ui.convertingProgress(name, spec, pendingFormats, compress, done, total, elapsed, estSec),
+        parse_mode: 'Markdown',
+      });
+    } catch (_) {
+      /* transient edit failure — the final results edit below is authoritative */
+    }
+  }, 2000);
+
   const results = [];
   const errors = [];
+  let done = 0;
 
+  // 3. Convert + upload, advancing the bar after each format lands.
   for (const fmt of pendingFormats) {
     try {
       const outPath = await convert(source, fmt, compress);
@@ -290,17 +316,28 @@ async function startConversion(chatId, session) {
     } catch (e) {
       errors.push({ fmt, message: e.message.split('\n')[0].slice(0, 120) });
     }
+    done += 1;
+    const elapsed = Math.floor((Date.now() - t0) / 1000);
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      text: ui.convertingProgress(name, spec, pendingFormats, compress, done, total, elapsed, estSec),
+      parse_mode: 'Markdown',
+    }).catch(() => {});
   }
 
+  clearInterval(timer);
   sessions.delete(chatId);
 
+  // 4. Results appear only after every format has finished (or failed).
+  const elapsed = Math.floor((Date.now() - t0) / 1000);
   await tg('editMessageText', {
     chat_id: chatId,
     message_id: statusMsg.message_id,
-    text: ui.results(name, results, errors),
+    text: ui.results(name, results, errors, elapsed),
     parse_mode: 'Markdown',
   }).catch(async () => {
-    await tg('sendMessage', { chat_id: chatId, text: ui.results(name, results, errors), parse_mode: 'Markdown' });
+    await tg('sendMessage', { chat_id: chatId, text: ui.results(name, results, errors, elapsed), parse_mode: 'Markdown' });
   });
 }
 
