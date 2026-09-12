@@ -64,6 +64,17 @@ async function putBytesToUrl(uploadUrl, localPath, contentType, size, partOffset
   // R2 presigned PUT: no Authorization header, just Content-Type.
   // For small files send the whole buffer; for multipart parts, slice the file.
   const headers = { 'Content-Type': contentType };
+
+  // Buffer upload (session-store blobs): send the buffer directly.
+  if (Buffer.isBuffer(localPath)) {
+    const res = await axios.put(uploadUrl, localPath, {
+      headers,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    });
+    return res;
+  }
+
   if (partSize != null) {
     // send Range-style body for a specific part: read [partOffset, partOffset+partSize)
     const buffer = await readRange(localPath, partOffset, partSize);
@@ -169,24 +180,24 @@ async function uploadMultipart(localPath, fileName, contentType, size, init) {
 /**
  * Upload a local file to storage.to and return the shareable URL + metadata.
  *
- * @param {string} localPath absolute path to the file to upload
- * @param {object} opts
+ * @param {string|Buffer} localPath absolute path to the file, or a Buffer.
+ * @param {object} [opts]
  * @param {string} opts.contentType required mime type
  * @param {string} [opts.filename]  override for the stored filename
  * @param {string} [opts.visitor]   override for the storage.to visitor
- * @returns {Promise<{url: string, id: string, expiresAt: string|null, filename: string, size: number}>}
+ * @returns {Promise<{url: string, id: string|null, expiresAt: string|null, filename: string, size: number}>}
  */
 async function upload(localPath, opts = {}) {
-  if (!localPath || !path.isAbsolute(localPath)) {
-    throw new Error('upload(): localPath must be an absolute path');
+  const isBuffer = Buffer.isBuffer(localPath);
+  if (!isBuffer && (!localPath || !path.isAbsolute(localPath))) {
+    throw new Error('upload(): localPath must be an absolute path or a Buffer');
   }
   if (!opts.contentType) {
     throw new Error('upload(): opts.contentType is required');
   }
 
-  const stat = await fs.promises.stat(localPath);
-  const size = stat.size;
-  const filename = opts.filename || path.basename(localPath);
+  const size = isBuffer ? localPath.length : (await fs.promises.stat(localPath)).size;
+  const filename = opts.filename || (isBuffer ? 'data' : path.basename(localPath));
   const visitor = opts.visitor || config.STORAGE_TO_VISITOR;
 
   const initBody = { filename, content_type: opts.contentType, size };
@@ -231,4 +242,37 @@ async function upload(localPath, opts = {}) {
   };
 }
 
-module.exports = { upload };
+/**
+ * Download the body of a Storage.to share URL, used to read back a
+ * session blob persisted by the durable session store.
+ *
+ * @param {string} filenameOrUrl stored filename (e.g. "session-123") or full URL
+ * @param {object} [opts]
+ * @param {boolean} [opts.expectError] when true, a 404/410 resolves to null
+ * @returns {Promise<string|null>} text body, or null if absent
+ */
+async function download(filenameOrUrl, opts = {}) {
+  const target =
+    /^https?:\/\//.test(filenameOrUrl)
+      ? filenameOrUrl
+      : `https://storage.to/${encodeURIComponent(filenameOrUrl)}`;
+  let res;
+  try {
+    res = await axios.get(target, {
+      responseType: 'text',
+      maxContentLength: Infinity,
+    });
+  } catch (err) {
+    if (opts.expectError && [404, 410].includes(err.response && err.response.status)) {
+      return null;
+    }
+    throw new Error(`storage.to download failed: ${err.message}`);
+  }
+  if (res.status < 200 || res.status >= 300) {
+    if (opts.expectError && [404, 410].includes(res.status)) return null;
+    throw new Error(`storage.to download returned non-2xx: ${res.status}`);
+  }
+  return typeof res.data === 'string' ? res.data : String(res.data ?? '');
+}
+
+module.exports = { upload, download };

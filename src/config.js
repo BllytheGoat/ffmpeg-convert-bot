@@ -35,7 +35,12 @@ function pick(key, fallback = '') {
 
 module.exports = {
   TELEGRAM_BOT_TOKEN: pick('TELEGRAM_BOT_TOKEN'),
+  TELEGRAM_WEBHOOK_SECRET: pick('TELEGRAM_WEBHOOK_SECRET'),
   STORAGE_TO_TOKEN: pick('STORAGE_TO_TOKEN'),
+  // Durable session state. Vercel KV (Upstash Redis) is the production
+  // backend: set REDIS_URL and the bot uses a real KV; otherwise it falls
+  // back to in-memory (local dev / tests).
+  REDIS_URL: pick('REDIS_URL'),
   STORAGE_TO_BASE: pick('STORAGE_TO_BASE', 'https://storage.to/api'),
   STORAGE_TO_VISITOR: pick('STORAGE_TO_VISITOR', 'hermes-ffmpeg-bot'),
   WEBHOOK_HOST: pick('WEBHOOK_HOST'), // e.g. https://ffmpeg-convert-bot.vercel.app

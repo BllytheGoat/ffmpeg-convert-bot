@@ -142,6 +142,17 @@ function downloadFailed() {
   return "Couldn't read that file. Check the link still works, then try again.";
 }
 
+// The user supplied a URL that failed the SSRF host check.
+function unsafeUrl() {
+  return "I can't use that link — it points to a host I won't fetch from. Send a public media link instead.";
+}
+
+// The stored source reference could no longer be re-fetched (link expired,
+// telegram file gone, or download failed mid-flow).
+function sourceGone() {
+  return "I lost the source file mid-conversion (links expire). Send it again and I'll start fresh.";
+}
+
 function noFormat() {
   return 'Pick a format first — tap one above, then Start.';
 }
@@ -193,6 +204,8 @@ module.exports = {
   results,
   tooBig,
   downloadFailed,
+  unsafeUrl,
+  sourceGone,
   noFormat,
   cancelled,
 };

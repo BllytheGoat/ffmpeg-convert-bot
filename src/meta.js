@@ -121,7 +121,9 @@ async function describeFile(filePath, mimeHint) {
   const parts = [];
   parts.push(kind);
 
-  const codec = isVideo ? codecLabel(v.codec_name) : codecLabel(v ? v.codec_name : (mimeHint || ''));
+  const codec = isVideo
+    ? codecLabel(v ? v.codec_name : null)
+    : codecLabel(v ? v.codec_name : (mimeHint || ''));
   if (codec) parts.push(codec);
 
   const w = v ? v.width : null;

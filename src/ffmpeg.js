@@ -77,7 +77,14 @@ const EXT_HINTS = {
   m4v: 'video', wmv: 'video', flv: 'video', mpg: 'video', mpeg: 'video',
 };
 
-async function detectKind(inputPath) {
+async function detectKind(inputPath, mimeHint = '') {
+  // Fast path: an authoritative MIME hint (e.g. from Telegram) decides
+  // without probing. This keeps detection cheap and deterministic when the
+  // caller already knows the content type.
+  const mime = String(mimeHint || '').toLowerCase();
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+
   const probe = resolveFfprobe();
   try {
     const { stdout } = await run(probe, [
@@ -104,18 +111,6 @@ async function detectKind(inputPath) {
   if (EXT_HINTS[ext] === 'image') return 'image';
   if (EXT_HINTS[ext] === 'video') return 'video';
   return 'video'; // default assumption for unknown inputs
-}
-
-/**
- * True when the input is a single-frame still image (as opposed to an
- * animated GIF or a video). Used to decide whether to wrap the input with
- * `-loop 1 -t 2` before running palettegen for GIF conversion.
- */
-function isStillImage(inputPath) {
-  const ext = path.extname(inputPath).replace('.', '').toLowerCase();
-  // Animated GIF has frames > 1; treat a .gif source as already-multipage.
-  if (ext === 'gif') return false;
-  return EXT_HINTS[ext] === 'image';
 }
 
 // ---------------------------------------------------------------------------
@@ -385,4 +380,4 @@ async function convert(inputPath, targetFormat, compress = false, outDir = null)
   return outPath;
 }
 
-module.exports = { convert, detectKind, isStillImage };
+module.exports = { convert, detectKind };
