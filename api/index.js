@@ -7,9 +7,9 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 
-const { convert } = require('./src/ffmpeg');
-const { upload } = require('./src/storage-to');
-const config = require('./src/config');
+const { convert } = require('../src/ffmpeg');
+const { upload } = require('../src/storage-to');
+const config = require('../src/config');
 
 // In-memory session state: chatId -> { sourcePath, kind, pendingFormats, compress }
 const sessions = new Map();
