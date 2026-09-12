@@ -1,6 +1,7 @@
-// index.js — Vercel Function: Telegram FFmpeg convert bot.
+// api/index.js — Vercel Function: Telegram FFmpeg convert bot.
 // Exposes GET / (health) and POST / (webhook) as a single-file Vercel function.
-// Spine only: delegates heavy work to src/ffmpeg.js and src/storage-to.js.
+// Spine only: delegates heavy work to src/ffmpeg.js, src/storage-to.js,
+// and the design layer src/ui.js (copy + keyboard).
 
 const fs = require('fs');
 const path = require('path');
@@ -9,28 +10,14 @@ const http = require('http');
 
 const { convert } = require('../src/ffmpeg');
 const { upload } = require('../src/storage-to');
+const { describeFile } = require('../src/meta');
+const ui = require('../src/ui');
 const config = require('../src/config');
 
-// In-memory session state: chatId -> { sourcePath, kind, pendingFormats, compress }
+// In-memory session state: chatId -> { sourcePath, kind, pendingFormats, compress, spec }
 const sessions = new Map();
 
-const FORMAT_CHOICES = {
-  image: ['PNG', 'JPEG', 'WEBP', 'GIF', 'AVIF'],
-  video: ['MP4', 'WEBM', 'MOV', 'MKV', 'AVI'],
-};
-
-const MIME_BY_FORMAT = {
-  PNG: 'image/png',
-  JPEG: 'image/jpeg',
-  WEBP: 'image/webp',
-  GIF: 'image/gif',
-  AVIF: 'image/avif',
-  MP4: 'video/mp4',
-  WEBM: 'video/webm',
-  MOV: 'video/quicktime',
-  MKV: 'video/x-matroska',
-  AVI: 'video/x-msvideo',
-};
+const { FORMAT_CHOICES, MIME_BY_FORMAT } = ui;
 
 // ---------------------------------------------------------------------------
 // Telegram API helper (raw HTTPS, zero deps)
@@ -98,39 +85,17 @@ function detectKind(filePath, mimeHint) {
 }
 
 // ---------------------------------------------------------------------------
-// Format menu (inline keyboard)
+// Menu presentation (design lives in src/ui.js)
 // ---------------------------------------------------------------------------
-function buildFormatMenu(kind, session) {
-  const formats = FORMAT_CHOICES[kind] || FORMAT_CHOICES.video;
-  const rows = [
-    // One button per format
-    formats.map((f) => ({
-      text: session.pendingFormats.includes(f) ? `✓ ${f}` : f,
-      callback_data: `fmt:${f}`,
-    })),
-    // Compress toggle + action row
-    [
-      {
-        text: session.compress ? '🗜  Compress: ON' : '🗜  Compress: OFF',
-        callback_data: 'compress:toggle',
-      },
-      { text: '❌  Cancel', callback_data: 'cancel' },
-    ],
-  ];
-  return rows;
-}
-
-async function sendFormatMenu(chatId, sourceInfo, kind) {
-  const session = sessions.get(chatId);
-  const formats = FORMAT_CHOICES[kind];
+async function sendMenu(chatId, session) {
+  const text = session.pendingFormats.length
+    ? ui.picked(session.name, session.spec, session.pendingFormats)
+    : ui.intake(session.name, session.spec);
   await tg('sendMessage', {
     chat_id: chatId,
-    text:
-      `Got ${sourceInfo.name} (${sourceInfo.mime}).\n` +
-      `Tap the formats you want converted (up to 5), toggle compression, then start.`,
-    reply_markup: {
-      inline_keyboard: buildFormatMenu(kind, session),
-    },
+    text,
+    parse_mode: 'Markdown',
+    reply_markup: ui.keyboard(session.kind, session),
   });
 }
 
@@ -162,15 +127,14 @@ async function handleIncomingMessage(msg) {
   if (!file_id) return;
 
   const mime = msg.video?.mime_type || msg.document?.mime_type || 'image/jpeg';
-  const name = msg.document?.file_name || (msg.video ? 'video' : 'file');
+  const name = msg.document?.file_name || (msg.video ? 'video' : 'image');
   const size = msg.document?.file_size || 0;
 
   if (size > config.MAX_SOURCE_BYTES) {
     await tg('sendMessage', {
       chat_id: chatId,
-      text:
-        `That file is ${Math.round(size / 1048576)} MB — over the 50 MB limit I can pull from Telegram. ` +
-        `Send me the file's public URL instead and I'll download it from there.`,
+      text: ui.tooBig(name, Math.round(size / 1048576)),
+      parse_mode: 'Markdown',
     });
     return;
   }
@@ -197,37 +161,48 @@ function guessMimeFromUrl(url) {
 }
 
 // ---------------------------------------------------------------------------
-// Source processing: download → detect → show menu
+// Source processing: download -> detect -> build ID card -> show menu
 // ---------------------------------------------------------------------------
 async function processSource(chatId, sourceInfo) {
   const workdir = path.join(config.WORKDIR, String(chatId));
   fs.mkdirSync(workdir, { recursive: true });
 
   let srcPath;
-  if (sourceInfo.url) {
-    srcPath = path.join(workdir, sourceInfo.name || 'source');
-    await httpDownload(sourceInfo.url, srcPath);
-  } else if (sourceInfo.file_id) {
-    const file = await tg('getFile', { file_id: sourceInfo.file_id });
-    const fileUrl = `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    srcPath = path.join(workdir, sourceInfo.name || 'source');
-    await httpDownload(fileUrl, srcPath);
-  } else {
-    throw new Error('no source provided');
+  try {
+    if (sourceInfo.url) {
+      srcPath = path.join(workdir, sourceInfo.name || 'source');
+      await httpDownload(sourceInfo.url, srcPath);
+    } else if (sourceInfo.file_id) {
+      const file = await tg('getFile', { file_id: sourceInfo.file_id });
+      const fileUrl = `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      srcPath = path.join(workdir, sourceInfo.name || 'source');
+      await httpDownload(fileUrl, srcPath);
+    } else {
+      throw new Error('no source provided');
+    }
+  } catch (e) {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: ui.downloadFailed(),
+    });
+    return;
   }
 
   const kind = detectKind(srcPath, sourceInfo.mime || '');
+  const spec = await describeFile(srcPath, sourceInfo.mime || '');
 
-  sessions.set(chatId, {
+  const session = {
     source: srcPath,
     kind,
     pendingFormats: [],
     compress: true, // default: compress on (recommended)
     mime: sourceInfo.mime,
     name: sourceInfo.name,
-  });
+    spec,
+  };
+  sessions.set(chatId, session);
 
-  await sendFormatMenu(chatId, sourceInfo, kind);
+  await sendMenu(chatId, session);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +218,7 @@ async function handleCallback(cq) {
     sessions.delete(chatId);
     await tg('sendMessage', {
       chat_id: chatId,
-      text: 'Cancelled. Send me another file or link when ready.',
+      text: ui.cancelled(),
     });
     return;
   }
@@ -253,12 +228,10 @@ async function handleCallback(cq) {
     await tg('editMessageText', {
       chat_id: chatId,
       message_id: cq.message.message_id,
-      text: session.compress
-        ? '🗜  Compression: ON — smaller files, minimal visible quality loss.'
-        : 'Compression: OFF — lossless / high-bitrate, larger files.',
-      reply_markup: {
-        inline_keyboard: buildFormatMenu(session.kind, session),
-      },
+      text: ui.picked(session.name, session.spec, session.pendingFormats) +
+        `\n\n${ui.compressNote(session.compress)}`,
+      parse_mode: 'Markdown',
+      reply_markup: ui.keyboard(session.kind, session),
     });
     return;
   }
@@ -268,39 +241,13 @@ async function handleCallback(cq) {
     if (!session.pendingFormats.includes(fmt)) {
       session.pendingFormats.push(fmt);
     }
-    if (session.pendingFormats.length >= 5) {
-      // All 5 picked — show "Start conversion" button
-      await tg('editMessageText', {
-        chat_id: chatId,
-        message_id: cq.message.message_id,
-        text:
-          `You picked: ${session.pendingFormats.join(', ')}\n` +
-          `Tap start to convert, or unselect formats by tapping them again.`,
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: session.compress ? '▶  Start (compressed)' : '▶  Start (lossless)',
-                callback_data: 'go',
-              },
-            ],
-            buildFormatMenu(session.kind, session),
-          ],
-        },
-      });
-    } else {
-      // Show current picks + remaining buttons
-      await tg('editMessageText', {
-        chat_id: chatId,
-        message_id: cq.message.message_id,
-        text:
-          `Picked: ${session.pendingFormats.join(', ')}\n` +
-          `Pick up to 5, toggle compression, then start.`,
-        reply_markup: {
-          inline_keyboard: buildFormatMenu(session.kind, session),
-        },
-      });
-    }
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: cq.message.message_id,
+      text: ui.picked(session.name, session.spec, session.pendingFormats),
+      parse_mode: 'Markdown',
+      reply_markup: ui.keyboard(session.kind, session),
+    });
     return;
   }
 
@@ -308,7 +255,7 @@ async function handleCallback(cq) {
     if (session.pendingFormats.length === 0) {
       await tg('sendMessage', {
         chat_id: chatId,
-        text: 'Pick at least one format before starting.',
+        text: ui.noFormat(),
       });
       return;
     }
@@ -321,10 +268,11 @@ async function handleCallback(cq) {
 // Conversion + upload + reply
 // ---------------------------------------------------------------------------
 async function startConversion(chatId, session) {
-  const { source, pendingFormats, compress } = session;
+  const { source, pendingFormats, compress, name, spec } = session;
   const statusMsg = await tg('sendMessage', {
     chat_id: chatId,
-    text: `Converting to ${pendingFormats.join(', ')}… ${compress ? '(compressed)' : '(lossless)'}\nThis can take a minute.`,
+    text: ui.converting(name, spec, pendingFormats, compress),
+    parse_mode: 'Markdown',
   });
 
   const results = [];
@@ -340,28 +288,19 @@ async function startConversion(chatId, session) {
       });
       results.push({ fmt, url: st.url, id: st.id, expiresAt: st.expiresAt, size: st.size });
     } catch (e) {
-      errors.push({ fmt, message: e.message.slice(0, 150) });
+      errors.push({ fmt, message: e.message.split('\n')[0].slice(0, 120) });
     }
   }
 
   sessions.delete(chatId);
 
-  let text = `Done! Your ${results.length} file(s):\n`;
-  for (const r of results) {
-    text += `• ${r.fmt}: ${r.url}\n`;
-  }
-  if (errors.length) {
-    text += `\n⚠️ ${errors.length} failed:\n`;
-    for (const e of errors) text += `• ${e.fmt}: ${e.message}\n`;
-  }
-  text += `\nFiles expire in 3 days.`;
-
   await tg('editMessageText', {
     chat_id: chatId,
     message_id: statusMsg.message_id,
-    text,
+    text: ui.results(name, results, errors),
+    parse_mode: 'Markdown',
   }).catch(async () => {
-    await tg('sendMessage', { chat_id: chatId, text });
+    await tg('sendMessage', { chat_id: chatId, text: ui.results(name, results, errors), parse_mode: 'Markdown' });
   });
 }
 
